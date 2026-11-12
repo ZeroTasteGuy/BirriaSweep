@@ -37,9 +37,9 @@ if (!(Test-Path $page)) { Run git clone --quiet $PageRepo $page }
 Push-Location $page
 Run git fetch --quiet origin $PageRef
 Run git checkout --quiet --force FETCH_HEAD
-Run npm ci --no-audit --no-fund
+Run npm.cmd ci --no-audit --no-fund
 $env:BROWSDR_BASE = '/'
-Run npx vite build
+Run npx.cmd vite build
 Pop-Location
 
 # 3. Python: the official embeddable build plus numpy, so nothing has to be installed.
