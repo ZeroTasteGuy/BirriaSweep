@@ -10,6 +10,9 @@ on:
       page_ref:
         description: BrowSDR_Sweep branch or tag for the bundled page
         default: main
+      release_tag:
+        description: Publish the ZIP as a release with this tag, e.g. v0.1.0 (empty = artifact only)
+        default: ''
 
 permissions:
   contents: write   # to publish releases on v* tags
@@ -38,9 +41,11 @@ jobs:
         with:
           name: BirriaSweep-windows-x64
           path: dist/BirriaSweep-windows-x64.zip
-      - if: startsWith(github.ref, 'refs/tags/v')
+      - if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: dist/BirriaSweep-windows-x64.zip
 
   linux:
