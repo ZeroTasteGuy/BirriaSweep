@@ -41,6 +41,25 @@ Tick **Sweep mode** in the left panel. You then choose the range:
 How fast it sweeps: the stick covers 35 MHz per step, so 5.6–6.0 GHz takes 12 steps and is
 redrawn about **30 times a second**. Twice the range takes twice as long.
 
+### Narrow ranges: watching bursts
+
+When the range fits in one tuning (up to 35 MHz at 40 MS/s, 70 MHz with `--rate 80`), the
+bridge stops retuning. It tunes once, putting the DC notch just outside the range when the
+range is narrow enough, and analyses the stream window after window. Each row is the per-bin
+**peak** over 1.6 ms of signal, and the page keeps the peak of all rows between two drawn
+frames. Together this means short bursts, like video frames, telemetry or Wi-Fi packets, show
+up instead of falling between snapshots. The bridge window prints how many rows per second it
+manages and how much of the signal it analyses.
+
+Two options change this:
+
+- `--watch-ms` sets the time per row.
+- `--watch-detector mean` gives a steadier floor instead of peaks.
+
+A wide sweep sees each frequency for only 0.4 ms per pass, so it can miss short bursts.
+
+### Filter shape
+
 The bridge also learns and removes the stick's filter shape, which would otherwise show as a
 hump in every 35 MHz step. Each time you start a sweep, it needs about a second for the floor to
 become flat.
@@ -69,7 +88,9 @@ Add options after the start file's name in a terminal (for example
 | `--settle-us N` | 100 | Microseconds discarded after each retune. Lower is faster, but the start of each step may then be smeared. |
 | `--capture N` | 16384 | Samples per sweep step (multiple of 2048). Fewer give a faster but noisier sweep. |
 | `--pipeline` | off | FFT on a second thread. About a third faster (≈40 sweeps/s), but the stick then overruns about once a minute; the bridge restarts it with a ~1 s gap. |
-| `--rate 80` | 40 | Experimental 80 MS/s (70 MHz per step, ≈55 sweeps/s). It can overrun, especially on slower PCs. |
+| `--rate 80` | 40 | 80 MS/s. It is reliable for the live view and for narrow ranges (up to 70 MHz, one tuning), where the stick isn't retuned constantly. Wide sweeps get 70 MHz per step (≈55 sweeps/s) but can overrun, because the many retunes disturb the stream. |
+| `--watch-ms N` | 1.6 | Narrow ranges: milliseconds of signal per row. |
+| `--watch-detector` | peak | Narrow ranges: `peak` shows short bursts, `mean` a steadier floor. |
 | `--dc-offset-mhz N` | 2 | Offset used to hide the DC notch. 0 shows the raw notch. |
 | `--flat-steps N` | 24 | Sweep steps per update of the filter-shape correction. 0 turns it off. |
 | `--fake` | off | No stick: synthetic tones. Use it to try the page. |

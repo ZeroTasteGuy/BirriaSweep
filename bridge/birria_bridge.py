@@ -19,6 +19,7 @@ from urllib.parse import unquote, urlsplit
 import numpy as np
 
 FULL_SCALE = 8192.0           # 14-bit samples
+LIVE_RATE = 40_000_000        # the page's live view always gets this rate (BrowSDR device setting)
 LEVEL_REFERENCE_FFT = 65536   # BrowSDR's level reference: dB values match its own FFT at this size
 DC_GUARD_HZ = 400_000         # half-width of the stick's DC notch around its tuned frequency
 HOSTED_PAGE = 'https://zerotasteguy.github.io/BrowSDR_Sweep/'  # always allowed to connect
@@ -41,6 +42,8 @@ class Config:
     read_priority: int = 1        # Windows priority of the native read thread (1 = above normal)
     dc_offset_hz: int = 2_000_000 # tuning offset that moves the DC notch (0 = leave the notch)
     flat_steps: int = 24          # sweep steps per update of the filter-shape correction (0 = off)
+    watch_samples: int = 65536    # samples per row when a sweep range fits in one tuning (1.6 ms)
+    watch_detector: str = 'peak'  # per-bin 'peak' or 'mean' over those samples
 
 
 cfg = Config()
@@ -107,7 +110,7 @@ class Stick:
             fn.argtypes, fn.restype = args, res
         self.box = self.disp.bs_display_create()
         self.scratch = np.empty((262144, 2), np.int16)
-        self.generation = 0
+        self.generation, self.last_first = 0, 0
         self.center, self.gain = 5_695_000_000, (1, 4, 0)
         self.restarts = []                         # times of recent automatic restarts
         self.lock = threading.Lock()               # serialises tune, gain and reopen
@@ -209,6 +212,7 @@ class Stick:
             r = self.disp.bs_display_take(self.box, self.scratch.ctypes.data_as(C.POINTER(C.c_int16)),
                                           len(self.scratch), C.byref(count), C.byref(first), C.byref(gen))
             if r == 1 and gen.value == self.generation and first.value >= after:
+                self.last_first = first.value
                 return self.scratch[:count.value].copy()
             if r == 1:
                 self.configure(size)               # too early: re-arm, or the mailbox waits 50 ms
@@ -227,6 +231,7 @@ class FakeStick:
 
     def __init__(self):
         self.center, self.n, self.rng = 5_695_000_000, 0, np.random.default_rng()
+        self.last_first = 0
 
     def tune(self, hz): self.center = int(hz)
     def ensure_stream(self): pass
@@ -240,6 +245,10 @@ class FakeStick:
         for f in (5_695e6, 5_806e6, 5_917e6):
             if abs(f - self.center) < cfg.rate / 2:
                 x += 3000 * np.exp(2j * np.pi * (f - self.center) * t)
+        if abs(5_800e6 - self.center) < cfg.rate / 2:      # 50 us bursts every 5 ms
+            on = ((self.n + np.arange(size)) % (cfg.rate // 200)) < cfg.rate // 20000
+            x += on * 3000 * np.exp(2j * np.pi * (5_800e6 - self.center) * t)
+        self.last_first = self.n
         self.n += size
         spectrum = np.fft.fft(x)
         notch = int(250_000 / cfg.rate * size)
@@ -291,6 +300,8 @@ class Session:
         self.parity = 1                 # which side of each step the stick is tuned to this pass
         self.previous_rows = {}         # last row sent per step, to fill the DC notch
         self.flat_profile, self.flat_recent = None, []
+        self.flat_profiles = {}         # learned filter shape per FFT size, kept for narrow ranges
+        self.single = False             # the sweep range fits in one tuning: see watch()
         self.live_last = None           # (centre, side, spectrum) of the previous live capture
         self.stats, self.work, self.last_report = [], [], 0.0
         # With --pipeline, FFT+send run on their own thread, so the next retune starts as soon as
@@ -312,8 +323,9 @@ class Session:
                 self.range = (int(msg['startMHz']), int(msg['stopMHz']))
                 self.fft_size = min(4096, max(16, int(msg.get('fftSize', 1024))))
                 self.plan = SweepPlan.make(self.fft_size)
+                self.single = (self.range[1] - self.range[0]) * 1_000_000 <= cfg.span_hz
                 self.previous_rows.clear()
-                self.flat_profile, self.flat_recent = None, []
+                self.flat_profile, self.flat_recent = self.flat_profiles.get(self.plan.fft_size), []
                 self.stick.ensure_stream()
                 self.mode = 'sweep'
             elif cmd == 'stop':
@@ -328,7 +340,7 @@ class Session:
                     self.ws.send_binary(self.live_snapshot().tobytes())
                     time.sleep(1 / 60)              # display snapshots, not a continuous stream
                 elif self.mode == 'sweep':
-                    self.sweep_once()
+                    self.watch() if self.single else self.sweep_once()
                 else:
                     time.sleep(0.02)
             except (OSError, ConnectionError):
@@ -359,7 +371,10 @@ class Session:
         n = cfg.capture
         if not cfg.dc_offset_hz:
             self.stick.tune(self.center)
-            return self.stick.take(n)
+            iq = self.stick.take(n)
+            if cfg.rate == LIVE_RATE:
+                return iq
+            return self.to_page_rate(np.fft.fftshift(np.fft.fft(as_complex(iq))))
         bin_hz = cfg.rate / n
         k = int(round(cfg.dc_offset_hz / bin_hz))
         with self.lock:
@@ -382,7 +397,15 @@ class Session:
             merged = np.where(score(side) >= score(last[1]), spectrum, last[2])
         else:                                       # first capture at this centre: its notch shows once
             merged = np.where(score(side) > -edge, spectrum, 0)   # drop the bins that wrapped around
-        y = np.fft.ifft(np.fft.ifftshift(merged))
+        return self.to_page_rate(merged)
+
+    @staticmethod
+    def to_page_rate(spectrum):
+        """Centred spectrum -> int16 I/Q at the page's LIVE_RATE. At 80 MS/s this keeps the
+        middle 40 MHz, where the wider receive filter is flat to the edges."""
+        m = len(spectrum) * LIVE_RATE // cfg.rate
+        lo = (len(spectrum) - m) // 2
+        y = np.fft.ifft(np.fft.ifftshift(spectrum[lo:lo + m])) * (m / len(spectrum))
         return np.clip(np.round(np.stack([y.real, y.imag], 1)), -8192, 8191).astype(np.int16)
 
     # ---- sweep -----------------------------------------------------------------------------
@@ -405,17 +428,68 @@ class Session:
             iq = self.stick.take(plan.capture, after=mark)
             t2 = time.perf_counter()
             if cfg.pipeline:
-                self.jobs.put((centre, iq, plan, shift))   # waits only if the worker is two steps behind
+                self.jobs.put((self.fft_send, (centre, iq, plan, shift)))   # waits only if two steps behind
             else:
                 self.fft_send(centre, iq, plan, shift)
             self.stats.append((t1 - t0, t2 - t1))
             f += plan.keep * plan.bin_hz
         self.report()
 
+    def watch(self):
+        """A sweep range that fits in one tuning: tune once and analyse the stream window after
+        window, so short bursts (video, telemetry, Wi-Fi packets) show up. A wide sweep sees each
+        frequency for 0.4 ms per pass; this sees most of the signal. Each row is the per-bin peak
+        (or mean) over cfg.watch_samples samples; the FFTs run on the worker thread while the next
+        window is read. The filter shape is not learned here (a steady signal would never move
+        out of its bins), only the one learned by a wide sweep is applied."""
+        plan, (start, stop) = self.plan, self.range
+        lo, hi = start * 1_000_000, stop * 1_000_000
+        margin = DC_GUARD_HZ + 2 * plan.bin_hz
+        # Put the DC notch just above the range when the range is narrow enough, else mid-range.
+        tuned = hi + margin if (hi + margin) - cfg.span_hz / 2 <= lo else (lo + hi) / 2
+        tuned = round(tuned / plan.bin_hz) * plan.bin_hz
+        with self.lock:
+            self.stick.tune(tuned)
+            after = self.stick.samples() + self.settle
+        size = max(plan.fft_size, cfg.watch_samples // plan.fft_size * plan.fft_size)
+        started, used, rows = time.monotonic(), 0, 0
+        first = after
+        while self.mode == 'sweep' and self.single and self.plan is plan and self.range == (start, stop) \
+                and self.ws.open:
+            iq = self.stick.take(size, after=after)
+            first = self.stick.last_first
+            after = first + len(iq)
+            used += len(iq)
+            rows += 1
+            self.jobs.put((self.watch_send, (tuned, iq, plan)))
+            if time.monotonic() - started >= 2:
+                elapsed = time.monotonic() - started
+                print(f'single tuning: {rows / elapsed:.0f} rows/s, {used / (elapsed * cfg.rate):.0%} of the '
+                      f'signal analysed ({cfg.watch_detector} of {size / cfg.rate * 1e3:.1f} ms per row)', flush=True)
+                started, used, rows = time.monotonic(), 0, 0
+
+    def watch_send(self, tuned, iq, plan):
+        n, keep = plan.fft_size, plan.keep
+        frames = as_complex(iq)[: len(iq) // n * n].reshape(-1, n)
+        spectrum = np.fft.fft(frames * plan.window, axis=1)
+        power = spectrum.real ** 2 + spectrum.imag ** 2
+        power = power.max(axis=0) if cfg.watch_detector == 'peak' else power.mean(axis=0)
+        db = 10 * np.log10(np.fft.fftshift(power) + 1e-20)
+        db -= self.flatness(db, learn=False)
+        lo = n // 2 - keep // 2
+        row = db[lo:lo + keep].astype(np.float32)
+        guard = int(DC_GUARD_HZ / plan.bin_hz)
+        a, b = keep // 2 - guard - 1, keep // 2 + guard + 1     # the notch at the tuned frequency
+        row[a + 1:b] = np.interp(np.arange(a + 1, b), [a, b], [row[a], row[b]])
+        try:
+            self.ws.send_binary(struct.pack('<Q', int(round(tuned - keep // 2 * plan.bin_hz))) + row.tobytes())
+        except (OSError, ConnectionError):
+            pass
+
     def _work(self):
         while (job := self.jobs.get()) is not None:
             try:
-                self.fft_send(*job)
+                job[0](*job[1])
             except Exception as e:
                 self.send_error(e)
 
@@ -451,7 +525,7 @@ class Session:
             pass
         self.work.append(time.perf_counter() - t)
 
-    def flatness(self, db):
+    def flatness(self, db, learn=True):
         """The stick's receive filter makes the noise floor sag toward the edges of every capture,
         the same shape at every tuning. Learn it from the steps themselves: every flat_steps
         steps, take the per-bin median over them (signals sit at different bins in each step, so
@@ -459,6 +533,8 @@ class Session:
         correction in dB, zero at the capture's middle, so the overall level stays put."""
         if cfg.flat_steps <= 0:
             return 0.0
+        if not learn:
+            return 0.0 if self.flat_profile is None else self.flat_profile
         self.flat_recent.append(db.copy())
         if len(self.flat_recent) >= cfg.flat_steps:
             shape = np.median(np.array(self.flat_recent), axis=0)
@@ -467,6 +543,7 @@ class Session:
             middle, eighth = len(db) // 2, len(db) // 8
             shape -= np.median(shape[middle - eighth: middle + eighth])
             self.flat_profile = shape if self.flat_profile is None else 0.8 * self.flat_profile + 0.2 * shape
+            self.flat_profiles[len(db)] = self.flat_profile
             self.flat_recent.clear()
         return 0.0 if self.flat_profile is None else self.flat_profile
 
@@ -681,16 +758,22 @@ def main():
                     help='Windows thread priority of the native reader (0 normal, 1 above normal)')
     ap.add_argument('--flat-steps', type=int, default=cfg.flat_steps,
                     help='sweep steps per update of the learned filter-shape correction (0 = off)')
+    ap.add_argument('--watch-ms', type=float, default=cfg.watch_samples / cfg.rate * 1e3,
+                    help='a sweep range that fits in one tuning gives one row per this many ms of signal')
+    ap.add_argument('--watch-detector', choices=('peak', 'mean'), default=cfg.watch_detector,
+                    help='how such a row combines its FFTs: peak shows short bursts, mean a steadier floor')
     ap.add_argument('--dc-offset-mhz', type=float, default=cfg.dc_offset_hz / 1e6,
                     help="tuning offset that hides the stick's DC notch (0 = leave the notch)")
     args = ap.parse_args()
 
     cfg.settle_us, cfg.pipeline, cfg.read_priority = args.settle_us, args.pipeline, args.read_priority
     cfg.flat_steps, cfg.dc_offset_hz = args.flat_steps, int(args.dc_offset_mhz * 1e6)
+    cfg.watch_detector = args.watch_detector
     cfg.capture = max(2048, args.capture // 2048 * 2048)
     cfg.batch = max(cfg.capture, args.batch // 2048 * 2048)
     if args.rate == 80:
         cfg.rate, cfg.span_hz = 80_000_000, 70_000_000
+    cfg.watch_samples = min(262144, max(2048, int(args.watch_ms * cfg.rate / 1000)))
 
     ui = (args.ui or here / 'ui').resolve()
     if not (ui / 'index.html').is_file():
